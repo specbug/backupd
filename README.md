@@ -1,6 +1,6 @@
 # backupd
 
-Backs up SQLite DBs and file trees from Podman volumes to Cloudflare R2. Runs in a container, loops on a fixed interval, reads jobs from a YAML file.
+Backup daemon for self-hosted Podman stacks. Ships to Cloudflare R2.
 
 ## Usage
 
