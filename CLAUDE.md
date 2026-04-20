@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Autostart (macOS)
+
+`scripts/backupd.plist` is the launchd agent that boots the stack on login. Installed at `~/Library/LaunchAgents/in.sixeleven.backupd.plist`, it invokes `~/.local/bin/backupd-start` (not the repo script directly — macOS TCC blocks launchd from executing files in `~/Documents/`).
+
+**After editing `scripts/start.sh`, re-copy it:**
+
+```sh
+cp scripts/start.sh ~/.local/bin/backupd-start && chmod +x ~/.local/bin/backupd-start
+launchctl kickstart -k "gui/$UID/in.sixeleven.backupd"   # re-run now
+```
+
 ## Commands
 
 ```sh

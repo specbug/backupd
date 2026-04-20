@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>in.sixeleven.backupd</string>
+
+    <!-- Points at an installed copy outside ~/Documents so launchd isn't blocked by macOS TCC.
+         Source of truth is scripts/start.sh; re-copy to ~/.local/bin/backupd-start on change. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/rishitv/.local/bin/backupd-start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/rishitv/Library/Logs/backupd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rishitv/Library/Logs/backupd-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/rishitv</string>
+    </dict>
+</dict>
+</plist>
