@@ -1,0 +1,17 @@
+# Backup jobs. Each job source path is inside the backupd container —
+# mount the relevant app volumes in compose.yml under /sources/<app> (read-only).
+#
+# Job types:
+#   sqlite — hot-backup via sqlite3 .backup, gzip, upload (replaces previous).
+#   sync   — rclone sync directory tree (skips unchanged files).
+
+jobs:
+  - name: odyssey-db
+    type: sqlite
+    source: /sources/odyssey/odyssey.db
+    destination: odyssey/db/odyssey.db.gz
+
+  - name: odyssey-uploads
+    type: sync
+    source: /sources/odyssey/uploads/
+    destination: odyssey/uploads/
