@@ -1,15 +1,8 @@
 # backupd
 
-Containerized backup daemon. Pushes SQLite DBs and file trees from local Podman/Docker volumes to Cloudflare R2 on a fixed interval.
+Backs up SQLite DBs and file trees from Podman volumes to Cloudflare R2. Runs in a container, loops on a fixed interval, reads jobs from a YAML file.
 
-## What it does
-
-- **`sqlite` jobs** — hot backup via `sqlite3 -readonly … .backup`, gzip, upload (replaces previous object).
-- **`sync` jobs** — `rclone sync` a directory tree (skips unchanged files).
-
-One daemon, one loop, reads jobs from `jobs.yml`. Fully virtualized — no host cron, no host tools beyond Podman.
-
-## Quick start
+## Usage
 
 ```sh
 cp .env.example .env   # fill in R2 creds
@@ -17,44 +10,34 @@ podman compose up -d --build
 podman logs -f backupd_backupd_1
 ```
 
-## Adding a new app
+## Adding an app
 
-1. Mount its volume read-only in `compose.yml` under `/sources/<app>`:
-   ```yaml
-   volumes:
-     - myapp-data:/sources/myapp:ro
-   ```
-   (The volume must use a stable top-level name — declare `name: myapp-data` in the app's compose file so it isn't project-prefixed.)
+1. Mount its volume in `compose.yml` at `/sources/<app>:ro`. The producing stack must declare its volume with a stable name (e.g. `name: myapp-data` in the app's compose) so Podman skips the project prefix.
+2. Append to `jobs.yml`:
 
-2. Append job entries to `jobs.yml`:
    ```yaml
    - name: myapp-db
      type: sqlite
      source: /sources/myapp/app.db
      destination: myapp/db/app.db.gz
    ```
-
 3. `podman compose up -d`.
+
+## Job types
+
+- `sqlite`: hot backup via `sqlite3 .backup`, gzip, upload. Replaces previous. No versioning.
+- `sync`: `rclone sync` a directory. Mirrors the source (deletes at dest if gone from source).
 
 ## Config
 
-### `.env`
-| Var | Purpose |
+`.env`:
+
+| Var | |
 |---|---|
 | `R2_ACCOUNT_ID` | Cloudflare account ID |
 | `R2_ACCESS_KEY_ID` | R2 API token access key |
 | `R2_SECRET_ACCESS_KEY` | R2 API token secret |
-| `R2_BUCKET` | Target bucket name |
-| `BACKUP_INTERVAL_SECONDS` | Cycle interval (default `86400` = 24h) |
+| `R2_BUCKET` | Target bucket |
+| `BACKUP_INTERVAL_SECONDS` | Cycle interval (default 86400) |
 
-### `jobs.yml`
-Each job: `name`, `type` (`sqlite` \| `sync`), `source` (path inside container), `destination` (key prefix in R2 bucket).
-
-## Layout
-
-```
-backup.sh    # daemon entrypoint — loops and dispatches jobs
-jobs.yml     # declarative backup jobs
-compose.yml  # single-service stack, mounts external volumes
-Dockerfile   # alpine + sqlite + rclone + yq
-```
+`jobs.yml`: list of `{ name, type, source, destination }`.
