@@ -18,6 +18,17 @@
     <key>KeepAlive</key>
     <false/>
 
+    <!-- See odyssey.plist for rationale — without AbandonProcessGroup,
+         launchd reaps vfkit (the podman VM) when this script exits,
+         collapsing the stack we just started. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <!-- Watchdog: re-run every 2 min. Script is idempotent and silent when healthy,
+         so this just restarts the stack if podman machine or the container dies. -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
     <key>StandardOutPath</key>
     <string>/Users/rishitv/Library/Logs/backupd.log</string>
     <key>StandardErrorPath</key>
