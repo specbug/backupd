@@ -25,11 +25,18 @@
 #   --seed      adopt the checked-out HEAD as deployed, without building
 set -euo pipefail
 
-PODMAN=/opt/homebrew/bin/podman
-CONF="${DEPLOYD_CONF:-/Users/rishitv/Documents/backupd/scripts/apps.conf}"
+# Overridable so the deploy path can be exercised against a throwaway stack
+# without a real `image prune` hitting this host.
+PODMAN="${PODMAN:-/opt/homebrew/bin/podman}"
+# The registry is read from ~/.local/etc, NOT from the repo. Under launchd,
+# TCC denies bash any read inside ~/Documents (verified: "Operation not
+# permitted"), even though git and podman hold grants there. Install it with
+# `cp scripts/apps.conf ~/.local/etc/deployd.conf`.
+CONF="${DEPLOYD_CONF:-$HOME/.local/etc/deployd.conf}"
 STATE_DIR="$HOME/.local/state/deployd"
 LOCK=/tmp/in.sixeleven.deployd.lock
-BUILD_TIMEOUT=900
+BUILD_TIMEOUT="${BUILD_TIMEOUT:-900}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 
 MODE=run
 case "${1:-}" in
@@ -82,8 +89,10 @@ deploy_app() {
     local state="$STATE_DIR/$name" failed="$STATE_DIR/$name.failed"
     local remote deployed current rc=0
 
-    if [[ ! -d "$path/.git" ]]; then
-        log "$name: $path is not a git repo, skipping"
+    # Asking git, not bash: a `[[ -d $path/.git ]]` test is denied by TCC under
+    # launchd and would look exactly like "not a git repo".
+    if ! git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+        log "$name: $path is not a readable git repo, skipping"
         return 0
     fi
 
@@ -107,9 +116,21 @@ deploy_app() {
     deployed=$(cat "$state" 2>/dev/null || true)
     [[ "$remote" == "$deployed" ]] && return 0
 
-    # A commit that failed to build is not retried until a newer one lands.
-    # Without this, one bad commit rebuilds on every tick, forever.
-    if [[ "$remote" == "$(cat "$failed" 2>/dev/null || true)" ]]; then
+    # A commit that keeps failing to build is eventually abandoned, so one bad
+    # commit can't rebuild on every tick forever. But not on the first failure:
+    # the build starts milliseconds after git rewrote the build context, and
+    # the podman VM's view of a just-replaced file can be briefly stale, which
+    # fails the build spuriously. Seen in testing, and it is the likeliest
+    # transient here precisely because deployd always builds right after a
+    # merge. Each commit gets MAX_ATTEMPTS ticks before we give up on it.
+    local failed_sha="" attempts=0
+    if [[ -f "$failed" ]]; then
+        read -r failed_sha attempts < "$failed" || true
+    fi
+    [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+    if [[ "$remote" != "$failed_sha" ]]; then
+        attempts=0
+    elif (( attempts >= MAX_ATTEMPTS )); then
         return 0
     fi
 
@@ -140,16 +161,35 @@ deploy_app() {
     fi
 
     local build_log="/tmp/deployd-$name.compose.log"
-    git -C "$path" fetch --quiet origin "$branch" \
-        && git -C "$path" merge --ff-only --quiet "$remote" \
+
+    if ! git -C "$path" fetch --quiet origin "$branch"; then
+        rm -rf "$app_lock"
+        log "$name: fetch failed, retrying next tick"
+        return 0
+    fi
+
+    # Divergence is a state of the repo, not a build failure. Saying so plainly
+    # beats burning retry attempts and pointing at an empty compose log.
+    if ! git -C "$path" merge-base --is-ancestor HEAD "$remote"; then
+        rm -rf "$app_lock"
+        log "$name: local $branch has diverged from origin, skipping"
+        return 0
+    fi
+
+    git -C "$path" merge --ff-only --quiet "$remote" \
         && with_timeout "$BUILD_TIMEOUT" compose_up "$path" >"$build_log" 2>&1 \
         || rc=$?
     rm -rf "$app_lock"
 
     if (( rc != 0 )); then
         mkdir -p "$STATE_DIR"
-        echo "$remote" > "$failed"
-        log "$name: deploy failed (rc=$rc), see $build_log. Holding at ${deployed:0:8}, will not retry ${remote:0:8}"
+        attempts=$(( attempts + 1 ))
+        echo "$remote $attempts" > "$failed"
+        if (( attempts >= MAX_ATTEMPTS )); then
+            log "$name: deploy failed (rc=$rc), attempt $attempts/$MAX_ATTEMPTS, giving up on ${remote:0:8} until a newer commit lands. See $build_log"
+        else
+            log "$name: deploy failed (rc=$rc), attempt $attempts/$MAX_ATTEMPTS, retrying next tick. See $build_log"
+        fi
         return 0
     fi
 

@@ -54,13 +54,21 @@ When the tracked branch moves it fast-forwards the working copy and runs
 endpoint and no shared secret.
 
 ```sh
+mkdir -p ~/.local/etc
+cp scripts/apps.conf ~/.local/etc/deployd.conf
 cp scripts/deploy.sh ~/.local/bin/deployd && chmod +x ~/.local/bin/deployd
 ~/.local/bin/deployd --seed          # adopt what's running now, no rebuild
 cp scripts/deployd.plist ~/Library/LaunchAgents/in.sixeleven.deployd.plist
 launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/in.sixeleven.deployd.plist
 ```
 
-Add a stack with one line in `scripts/apps.conf`:
+Needs Full Disk Access for `/opt/homebrew/bin/git`. Under launchd, macOS
+denies `~/Documents` per binary: `git` and `podman` hold grants, `bash` does
+not, which is why the registry is installed to `~/.local/etc` rather than read
+from this repo.
+
+Add a stack with one line in `scripts/apps.conf`, then re-copy it to
+`~/.local/etc/deployd.conf`:
 
 ```
 <name>  <repo path>  <branch>

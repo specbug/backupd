@@ -112,11 +112,17 @@ and every 5 min (`StartInterval=300`).
 ### Installing deployd
 
 ```sh
+mkdir -p ~/.local/etc
+cp scripts/apps.conf ~/.local/etc/deployd.conf     # registry, see TCC note below
 cp scripts/deploy.sh ~/.local/bin/deployd && chmod +x ~/.local/bin/deployd
 ~/.local/bin/deployd --seed          # adopt what's running now, no rebuild
 cp scripts/deployd.plist ~/Library/LaunchAgents/in.sixeleven.deployd.plist
 launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/in.sixeleven.deployd.plist
 ```
+
+Requires **Full Disk Access for `/opt/homebrew/bin/git`** (System Settings →
+Privacy & Security). Granted 2026-09-04. Without it deployd hangs, see the
+TCC note below.
 
 **After editing `scripts/deploy.sh`, re-copy it** (same TCC reason as
 `start.sh`):
@@ -126,10 +132,15 @@ cp scripts/deploy.sh ~/.local/bin/deployd && chmod +x ~/.local/bin/deployd
 launchctl kickstart -k "gui/$UID/in.sixeleven.deployd"
 ```
 
-`scripts/apps.conf` is read fresh every tick, so registry edits need no
-restart. It is read from `~/Documents/backupd/scripts/apps.conf` at
-runtime, the one file the agent reads out of `~/Documents`. Traversal works
-there (both watchdogs already `cd` into `~/Documents`); only exec is blocked.
+**After editing `scripts/apps.conf`, re-copy it too:**
+
+```sh
+cp scripts/apps.conf ~/.local/etc/deployd.conf
+```
+
+The registry is read from `~/.local/etc/deployd.conf`, not from this repo,
+because bash cannot read anything under `~/Documents` when running from
+launchd. No restart is needed after copying: it is re-read every tick.
 
 ### deployd commands
 
@@ -177,6 +188,29 @@ launchctl kickstart -k "gui/$UID/in.sixeleven.deployd"   # tick now
   running containers were built from. Seeding a repo whose origin is ahead
   leaves those commits to deploy on the next tick, which is what you want.
   First run without `--seed` rebuilds every app once to establish a baseline.
+- **TCC is the sharp edge here, and it is per-binary.** Under launchd, macOS
+  denies `~/Documents` to processes without a grant. Measured on this box:
+  `git` and `podman` are allowed (both hold Full Disk Access), `bash` is not.
+  So `cat`, `ls` and `[[ -d ... ]]` against a repo path all fail with
+  "Operation not permitted", while `git -C <repo>` works fine. `cd` is
+  allowed, which is why `compose_up` and both watchdogs can chdir in there.
+  Consequences, all deliberate: the registry lives in `~/.local/etc`, and the
+  "is this a git repo" check asks `git rev-parse` rather than stat'ing
+  `.git`. Before the grant existed, `git` did not fail, it **hung forever**
+  waiting on a consent dialog that never appears for a background agent.
+  That grant is a manual GUI setting and is not in version control. If
+  deployd ever starts hanging or logging "not a readable git repo", check it
+  first.
+- **A build can fail spuriously right after the merge.** The build starts
+  milliseconds after git rewrote the tree, and the podman VM's view of a
+  replaced file can be briefly stale. Observed in testing: a commit failed,
+  then the identical commit succeeded on retry with nothing changed. This is
+  why failures retry `MAX_ATTEMPTS` times instead of being fatal on the first
+  one. A failed deploy also leaves the working copy at the new commit while
+  state still names the old one; the next successful tick reconciles it.
+- **Divergence is detected before the merge**, with `merge-base
+  --is-ancestor`, so it reports as a repo state rather than as a build
+  failure pointing at an empty compose log.
 - `deploy_app` is called with `</dev/null`. git shells out to ssh, which
   drains stdin and would otherwise eat the rest of `apps.conf` in the read
   loop.
