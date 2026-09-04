@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>in.sixeleven.deployd</string>
+
+    <!-- Points at an installed copy outside ~/Documents so launchd isn't blocked by macOS TCC.
+         Source of truth is deploy.sh; re-copy to ~/.local/bin/deployd on change. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/rishitv/.local/bin/deployd</string>
+    </array>
+
+    <!-- Run at every login. The podman socket is usually still down this early,
+         in which case the script exits immediately and the next tick picks it up. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't restart the poller itself; it is meant to exit after each tick. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- `podman compose up --build` spawns build processes as our children.
+         Without this key launchd reaps the whole process group when the script
+         exits, which would kill a build mid-flight. Same reason the odyssey and
+         backupd agents set it. -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <!-- Poll every 5 min. `git ls-remote` is cheap, but a rebuild can take
+         minutes, so ticks are spaced wide enough that they rarely stack.
+         Overlap is harmless anyway: the run holds /tmp/in.sixeleven.deployd.lock
+         and a second tick exits on sight of it. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/rishitv/Library/Logs/deployd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rishitv/Library/Logs/deployd-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/rishitv</string>
+    </dict>
+</dict>
+</plist>
