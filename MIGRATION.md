@@ -72,23 +72,38 @@ handling in `running_containers` did not fix it and it needs a real diagnosis.
 
 ## 5. Rename the repo
 
-The framework outgrew the name. Do this last, after the above is stable.
+The framework outgrew the name. Do this **last**, once the above is stable, so
+a rename cannot be confused with a cutover fault.
+
+Note what does *not* change: the app is still called `backupd` in `deploy.yml`,
+so the compose project, the container name `backupd_backupd_1` and the state
+file `~/.local/state/hostd/backupd` are all untouched. Only the repository and
+its directory are renamed.
 
 ```sh
-gh repo rename hostd -R specbug/backupd
+gh repo rename hostd -R specbug/backupd     # GitHub redirects the old URL
 cd ~/Documents && mv backupd hostd
 cd hostd && git remote set-url origin git@github.com:specbug/hostd.git
+git remote -v                                # confirm before continuing
 ```
 
-Then update the registry path and reinstall:
+The registry still points at the old path, so fix it and reinstall. `hostd
+install` re-copies `apps.conf` to `~/.local/etc/hostd/`, which is what actually
+takes effect:
 
 ```sh
 sed -i '' 's|Documents/backupd|Documents/hostd|' framework/apps.conf
-./framework/hostd sync && git commit -am "chore: rename backupd to hostd"
+./framework/hostd sync
+git commit -am "chore: rename backupd to hostd" && git push
 ./framework/hostd install
+./framework/hostd status                     # all three apps must still resolve
 ```
 
-Also update `../odyssey/CLAUDE.md`, which refers to `../backupd`.
+Then update the one cross-repo reference: `../odyssey/CLAUDE.md` points at
+`../backupd`. Commit that on its own branch.
+
+If `status` shows `no manifest` for backupd afterwards, the registry path is
+still stale: check `~/.local/etc/hostd/apps.conf`, not the one in the repo.
 
 ## Still outstanding
 
