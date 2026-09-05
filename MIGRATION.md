@@ -2,6 +2,19 @@
 
 One-time. Delete this file once it is done.
 
+**There is a script for all of this**, once the three PRs are merged and pulled:
+
+```sh
+./framework/cutover.sh --dry-run    # print every action, change nothing
+./framework/cutover.sh              # do it
+./framework/cutover.sh --rollback   # put the old agents back
+```
+
+It refuses to start unless all three repos are merged, clean and level with
+origin, backs up everything it removes, and covers steps 2 through 5 below.
+The rest of this file is what it does, for when you want to do it by hand or
+understand what went wrong.
+
 Replaces three launchd agents (`in.sixeleven.odyssey`, `in.sixeleven.backupd`,
 `in.sixeleven.deployd`) with two (`in.sixeleven.hostd-watch`,
 `in.sixeleven.hostd-deploy`), and three hand-maintained scripts with one.
@@ -39,17 +52,23 @@ rm -f ~/.local/etc/deployd.conf
 
 The containers keep running. Nothing is supervising them for the next minute.
 
-## 3. Install hostd
+## 3. Seed first, then install
+
+Order matters here. The agents carry `RunAtLoad=true`, so `hostd install`
+bootstraps them and the deploy agent fires *immediately*. With no state it
+treats every app as never-deployed and rebuilds all three from scratch,
+including excalidraw's multi-minute vite build, recreating healthy containers
+for no reason. Seeding first makes that first tick a no-op.
+
+The registry is not installed yet at this point, so point at the repo's copy.
+State lands in `~/.local/state/hostd` either way.
 
 ```sh
 cd ~/Documents/backupd
+HOSTD_CONF="$PWD/framework/apps.conf" ./framework/hostd seed
 ./framework/hostd install
-./framework/hostd seed          # adopt the running containers, no rebuild
 ./framework/hostd status
 ```
-
-`seed` matters. Without it the first tick rebuilds all three stacks from
-scratch, including excalidraw's multi-minute vite build.
 
 Old deploy state under `~/.local/state/deployd/` is now unused and can go.
 
