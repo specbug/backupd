@@ -18,6 +18,15 @@ services:
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
       R2_BUCKET: ${R2_BUCKET}
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      # Google Drive, the secondary mirror. All optional: with GDRIVE_ENABLED
+      # unset the container behaves exactly as it did before Drive existed.
+      GDRIVE_ENABLED: ${GDRIVE_ENABLED:-}
+      GDRIVE_TOKEN: ${GDRIVE_TOKEN:-}
+      GDRIVE_ROOT_FOLDER_ID: ${GDRIVE_ROOT_FOLDER_ID:-}
+      GDRIVE_CLIENT_ID: ${GDRIVE_CLIENT_ID:-}
+      GDRIVE_CLIENT_SECRET: ${GDRIVE_CLIENT_SECRET:-}
+      GDRIVE_VERSIONS_DIR: ${GDRIVE_VERSIONS_DIR:-_versions}
+      GDRIVE_VERSIONS_KEEP: ${GDRIVE_VERSIONS_KEEP:-90}
 
 volumes:
   # >>> hostd:volumes
