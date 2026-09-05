@@ -209,11 +209,25 @@ app_lock()  { echo "/tmp/hostd.$1.lock"; }
 state_file() { echo "$STATE_DIR/$1"; }
 
 compose_up()       { cd "$1" && "$PODMAN" compose up -d; }
-# --force-recreate is required, not cosmetic. podman-compose rebuilds the image
-# under --build but leaves a running container on its old image, so a deploy
-# recorded success while the containers kept serving the previous bundle.
-# Observed on odyssey_web_1 and draw_web_1 simultaneously.
-compose_up_build() { cd "$1" && "$PODMAN" compose up -d --build --force-recreate; }
+# Build, then down, then up. Not `up -d --build`, which rebuilds the image and
+# then leaves the running container attached to the previous one: a deploy
+# recorded success while odyssey_web_1 and draw_web_1 both kept serving stale
+# bundles, with nothing in any log to say so.
+#
+# `--force-recreate` does not fix it either. Under podman-compose 1.5.0 it
+# cannot remove a container that has dependents, so with any `depends_on` it
+# fails with "has dependent containers" and then "name is already in use",
+# leaving the stack exactly as it was.
+#
+# Building first keeps the old containers serving for the length of the build,
+# so the outage is only the down/up. This is the same incantation CLAUDE.md
+# already documents as the reliable way to make podman-compose recreate.
+compose_up_build() {
+    cd "$1" || return 1
+    "$PODMAN" compose build || return 1
+    "$PODMAN" compose down || true
+    "$PODMAN" compose up -d
+}
 
 # --- watch -----------------------------------------------------------------
 # One pass over every app. The machine is started at most once per pass, by
