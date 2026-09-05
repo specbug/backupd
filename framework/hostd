@@ -209,7 +209,11 @@ app_lock()  { echo "/tmp/hostd.$1.lock"; }
 state_file() { echo "$STATE_DIR/$1"; }
 
 compose_up()       { cd "$1" && "$PODMAN" compose up -d; }
-compose_up_build() { cd "$1" && "$PODMAN" compose up -d --build; }
+# --force-recreate is required, not cosmetic. podman-compose rebuilds the image
+# under --build but leaves a running container on its old image, so a deploy
+# recorded success while the containers kept serving the previous bundle.
+# Observed on odyssey_web_1 and draw_web_1 simultaneously.
+compose_up_build() { cd "$1" && "$PODMAN" compose up -d --build --force-recreate; }
 
 # --- watch -----------------------------------------------------------------
 # One pass over every app. The machine is started at most once per pass, by
@@ -266,6 +270,29 @@ probe_health() {
     "$PODMAN" restart "$target" >/dev/null 2>&1 || log "$name: restart failed"
 }
 
+# Why a deploy would refuse to touch this app, or empty if it would proceed.
+#
+# Shared by `tick` and `status` deliberately. When status derived this
+# separately it could disagree with what tick actually did, which is the same
+# duplicate-logic drift this whole framework exists to remove.
+#
+# Offline only: it inspects the working copy, never the network. Divergence is
+# not checked here because that needs a fresh fetch, so it stays in deploy_app.
+deploy_blocker() {   # deploy_blocker <repo> <branch>
+    local repo="$1" branch="$2" current
+    current=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null) \
+        || { echo "not a readable git repo"; return 0; }
+    if [[ "$current" != "$branch" ]]; then
+        echo "checked out on '$current', not '$branch'"
+        return 0
+    fi
+    if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then
+        echo "working tree dirty"
+        return 0
+    fi
+    return 0
+}
+
 # --- tick (deploy) ---------------------------------------------------------
 cmd_tick() {
     TAG=hostd-deploy
@@ -289,7 +316,7 @@ cmd_tick() {
 deploy_app() {
     local repo="$1"
     local name="$M_NAME" branch="$M_BRANCH" timeout="$M_TIMEOUT"
-    local state failed remote deployed current rc=0
+    local state failed remote deployed rc=0
     state=$(state_file "$name"); failed="$state.failed"
 
     # Ask git, not bash. `[[ -d $repo/.git ]]` is denied by TCC under launchd
@@ -320,12 +347,14 @@ deploy_app() {
     log "$name: origin/$branch at ${remote:0:8}, deployed ${shown:-none}"
 
     # Guards. Anything unexpected about the working copy is a skip, never a
-    # force: an auto-deploy must not be able to lose your work.
-    current=$(git -C "$repo" rev-parse --abbrev-ref HEAD)
-    [[ "$current" == "$branch" ]] \
-        || { log "$name: checked out on '$current', not '$branch', skipping"; return 0; }
-    [[ -z "$(git -C "$repo" status --porcelain)" ]] \
-        || { log "$name: working tree dirty, skipping"; return 0; }
+    # force: an auto-deploy must not be able to lose your work. `status` reports
+    # the same verdict from the same function.
+    local blocker
+    blocker=$(deploy_blocker "$repo" "$branch")
+    if [[ -n "$blocker" ]]; then
+        log "$name: $blocker, skipping"
+        return 0
+    fi
 
     if (( DRY_RUN )); then
         log "$name: DRY RUN, would fast-forward to ${remote:0:8} and rebuild"
@@ -412,16 +441,18 @@ cmd_seed() {
     (( found )) || die "no such app: $want"
 }
 
+STATUS_FMT='%-12s %-8s %-10s %-10s %-7s %-7s %s\n'
 cmd_status() {
     local repo running have_podman=1
     running=$(running_containers) || have_podman=0
-    printf '%-12s %-8s %-10s %-10s %-9s %s\n' APP BRANCH DEPLOYED HEAD STACK HEALTH
+    # shellcheck disable=SC2059
+    printf "$STATUS_FMT" APP BRANCH DEPLOYED HEAD STACK HEALTH NOTE
     for repo in $(read_registry); do
         if ! load_manifest "$repo"; then
-            printf '%-12s %-8s %-10s %-10s %-9s %s\n' "$(basename "$repo")" - - - - "no manifest"
+            printf "$STATUS_FMT" "$(basename "$repo")" - - - - - "no manifest"
             continue
         fi
-        local dep head stack health
+        local dep head stack health note blocker failed fsha fatt
         dep=$(cat "$(state_file "$M_NAME")" 2>/dev/null || echo "-")
         head=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "-")
         if (( have_podman )) && [[ -n "$M_CONTAINER" ]]; then
@@ -436,9 +467,24 @@ cmd_status() {
         else
             health=FAIL
         fi
-        [[ -f "$(state_file "$M_NAME").failed" ]] && health="$health (build failing)"
-        printf '%-12s %-8s %-10s %-10s %-9s %s\n' \
-            "$M_NAME" "$M_BRANCH" "${dep:0:8}" "${head:0:8}" "$stack" "$health"
+
+        # Why DEPLOYED and HEAD differ. Without this the table shows the drift
+        # but not the cause, and the only way to find out is the deploy log.
+        note=""
+        failed="$(state_file "$M_NAME").failed"
+        blocker=$(deploy_blocker "$repo" "$M_BRANCH")
+        if [[ -n "$blocker" ]]; then
+            note="PAUSED: $blocker"
+        elif [[ -f "$failed" ]]; then
+            fsha=""; fatt=0
+            read -r fsha fatt < "$failed" || true
+            note="build failing (${fatt:-?}/$MAX_ATTEMPTS at ${fsha:0:8})"
+        elif [[ "$dep" != "-" && "$dep" != "$head" ]]; then
+            note="deploys on the next tick"
+        fi
+
+        printf "$STATUS_FMT" \
+            "$M_NAME" "$M_BRANCH" "${dep:0:8}" "${head:0:8}" "$stack" "$health" "$note"
     done
 }
 
