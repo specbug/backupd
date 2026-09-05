@@ -1,6 +1,10 @@
 # backupd
 
-Backup daemon for self-hosted Podman stacks. Ships to Cloudflare R2.
+Two daemons for a self-hosted Podman host.
+
+- **backupd**, a container: backs app data up to Cloudflare R2.
+- **deployd**, `scripts/deploy.sh`: rebuilds every compose stack on the host
+  when its GitHub branch moves.
 
 ## Usage
 
@@ -41,3 +45,41 @@ podman logs -f backupd_backupd_1
 | `BACKUP_INTERVAL_SECONDS` | Cycle interval (default 86400) |
 
 `jobs.yml`: list of `{ name, type, source, destination }`.
+
+## Deploys
+
+`scripts/deploy.sh` polls each repo in `scripts/apps.conf` every 5 minutes.
+When the tracked branch moves it fast-forwards the working copy and runs
+`podman compose up -d --build`. Pull-based, so there is no webhook, no public
+endpoint and no shared secret.
+
+```sh
+mkdir -p ~/.local/etc
+cp scripts/apps.conf ~/.local/etc/deployd.conf
+cp scripts/deploy.sh ~/.local/bin/deployd && chmod +x ~/.local/bin/deployd
+~/.local/bin/deployd --seed          # adopt what's running now, no rebuild
+cp scripts/deployd.plist ~/Library/LaunchAgents/in.sixeleven.deployd.plist
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/in.sixeleven.deployd.plist
+```
+
+Needs Full Disk Access for `/opt/homebrew/bin/git`. Under launchd, macOS
+denies `~/Documents` per binary: `git` and `podman` hold grants, `bash` does
+not, which is why the registry is installed to `~/.local/etc` rather than read
+from this repo.
+
+Add a stack with one line in `scripts/apps.conf`, then re-copy it to
+`~/.local/etc/deployd.conf`:
+
+```
+<name>  <repo path>  <branch>
+```
+
+`<name>` must match the app's watchdog label suffix (`in.sixeleven.<name>`),
+since deployd takes that lock before rebuilding.
+
+It skips an app, and says so in `~/Library/Logs/deployd.log`, when the working
+tree is dirty, the checkout is off the tracked branch, the branch diverged, a
+watchdog holds the lock, or that commit already failed to build. Fast-forward
+only, never `reset --hard`, so an auto-deploy cannot eat uncommitted work.
+
+No rollback: revert and push, and deployd picks it up.
