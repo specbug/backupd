@@ -1,0 +1,17 @@
+# hostd manifest. Everything hostd needs to deploy and supervise this app.
+# Read from the committed blob at HEAD, never from the working copy. See SPEC.md.
+#
+# This repo is both the framework and one of the apps it hosts: the backup
+# container is an ordinary compose stack with no privileges the others lack.
+
+name: backupd
+branch: main
+
+health:
+  # backupd has no HTTP endpoint; it is a 24h rclone loop. "The container is
+  # in the running state" is therefore the entire health signal, so `url` is
+  # omitted and hostd runs no probe.
+  container: backupd_backupd_1
+
+# No `backup:` block. This is the thing doing the backing up, and its own
+# state is jobs.yml, which is in git.
