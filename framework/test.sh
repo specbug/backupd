@@ -19,6 +19,14 @@ ROOT="${TMPDIR:-/tmp}/hostd-test"
 REALPODMAN=/opt/homebrew/bin/podman
 PASS=0; FAIL=0
 
+# Back-to-back runs used to race: teardown is asynchronous, so run 2 could
+# start while run 1's container still held port 8199. Clear it and wait.
+"$REALPODMAN" rm -f hostdtest_app_1 >/dev/null 2>&1 || true
+for _ in $(seq 1 20); do
+    "$REALPODMAN" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx hostdtest_app_1 || break
+    sleep 1
+done
+rm -rf /tmp/hostd.testapp.lock /tmp/hostd.watch.lock /tmp/hostd.deploy.lock
 rm -rf "$ROOT"; mkdir -p "$ROOT/bin"
 export HOSTD_CONF="$ROOT/apps.conf"
 export HOSTD_STATE="$ROOT/state"
@@ -179,6 +187,58 @@ check "dry run does not touch state" "$(cat "$STATE")" "$pre"
 check "dry run does not move the working copy" "$(sha)" "$prehead"
 tick >/dev/null
 
+# --- status notes ----------------------------------------------------------
+# status used to show DEPLOYED != HEAD with no indication of why, so the only
+# way to learn an app was paused was to read the deploy log. A real app sat
+# undeployed for two hours because its checkout was on a topic branch.
+sec "status explains why an app is not deploying"
+st() { "$HOSTD" status 2>&1 | grep "^testapp" || true; }
+
+out=$(st); hasnt "a level, clean app has no note" "$out" "PAUSED"
+
+git -C "$APP" checkout -q -b topicbranch
+out=$(st)
+has "wrong branch is reported as PAUSED" "$out" "PAUSED"
+has "the note names the actual checkout" "$out" "topicbranch"
+git -C "$APP" checkout -q main
+
+echo dirt > "$APP/dirty.txt"
+out=$(st); has "a dirty tree is reported as PAUSED" "$out" "working tree dirty"
+rm -f "$APP/dirty.txt"
+
+git -C "$APP" rev-parse HEAD~1 > "$STATE"
+out=$(st); has "an app merely behind says it will deploy, not PAUSED" "$out" "deploys on the next tick"
+hasnt "being behind is not reported as PAUSED" "$out" "PAUSED"
+"$HOSTD" seed testapp >/dev/null 2>&1
+
+echo "$(sha) 2" > "$STATE.failed"
+out=$(st); has "a failing build is reported with its attempt count" "$out" "build failing (2/3"
+rm -f "$STATE.failed"
+out=$(st); hasnt "clearing the marker clears the note" "$out" "build failing"
+
+# The whole point of sharing deploy_blocker: status must never claim an app is
+# fine when tick would skip it, or vice versa. tick returns early when there is
+# nothing to deploy, so origin has to have actually moved for it to reach the
+# guards at all.
+write_app v9
+git -C "$APP" add -A && git -C "$APP" commit -qm v9 && git -C "$APP" push -q origin main
+git -C "$APP" reset -q --hard HEAD~1
+git -C "$APP" checkout -q -b topicbranch2
+sout=$(st); tout=$(tick)
+if grep -q PAUSED <<<"$sout" && grep -q "skipping" <<<"$tout"; then
+    ok "status and tick agree that the app is blocked"
+else
+    bad "status and tick agree that the app is blocked" "status=[$sout] tick=[$tout]"
+fi
+if grep -q "topicbranch2" <<<"$sout" && grep -q "topicbranch2" <<<"$tout"; then
+    ok "both name the same offending branch"
+else
+    bad "both name the same offending branch" "status=[$sout] tick=[$tout]"
+fi
+git -C "$APP" checkout -q main
+git -C "$APP" reset -q --hard origin/main
+tick >/dev/null 2>&1
+
 # --- watchdog --------------------------------------------------------------
 sec "watchdog"
 sleep 2
@@ -278,6 +338,11 @@ has "self_install writes the binary" "$out" "INSTALLED"
 # --- teardown --------------------------------------------------------------
 cd "$APP" && $REALPODMAN compose down -t 2 >/dev/null 2>&1
 $REALPODMAN rm -f hostdtest_app_1 >/dev/null 2>&1
+# Do not return until it is really gone, so a following run cannot race us.
+for _ in $(seq 1 20); do
+    $REALPODMAN ps -a --format '{{.Names}}' 2>/dev/null | grep -qx hostdtest_app_1 || break
+    sleep 1
+done
 rm -rf /tmp/hostd.testapp.lock /tmp/hostd.watch.lock /tmp/hostd.deploy.lock
 
 printf '\n=====================\n  %d passed, %d failed\n=====================\n' "$PASS" "$FAIL"
