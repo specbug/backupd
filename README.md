@@ -1,12 +1,83 @@
-# backupd
+# hostd
 
-Two daemons for a self-hosted Podman host.
+Single-host CI/CD and supervision for a self-hosted Podman box (one Mac mini).
 
-- **backupd**, a container: backs app data up to Cloudflare R2.
-- **deployd**, `scripts/deploy.sh`: rebuilds every compose stack on the host
-  when its GitHub branch moves.
+An app declares itself in one `deploy.yml` at its repo root and carries no
+hosting machinery of its own. hostd deploys it when its branch moves, keeps it
+running, probes its health, and backs its data up to Cloudflare R2.
 
-## Usage
+`SPEC.md` is the contract. It is the only thing an app needs to read.
+
+This repo is also one of the hosted apps: **backupd**, the container at the
+root, is an ordinary compose stack with no privileges the others lack.
+
+## Onboarding an app
+
+```yaml
+# deploy.yml, at the app repo root
+name: draw
+branch: master
+
+health:
+  container: draw_api_1
+  url: http://localhost:8100/health
+
+backup:
+  volume: draw-data
+  jobs:
+    - {type: sync, source: scenes/, destination: draw/scenes/}
+```
+
+```sh
+hostd add ~/Documents/excalidraw   # after committing the manifest
+git commit -am "onboard draw"      # the regenerated jobs.yml + compose.yml
+hostd install
+```
+
+Every block is optional except `name`. No `health.url` means no HTTP probe; no
+`backup` means no backup jobs.
+
+## Running it
+
+Two launchd agents run the same binary, however many apps are hosted.
+
+| agent | every | does |
+| --- | --- | --- |
+| `in.sixeleven.hostd-watch` | 120s | podman machine up, stacks up, health probes |
+| `in.sixeleven.hostd-deploy` | 300s | one `git ls-remote` per app, ff-merge, rebuild |
+
+```sh
+hostd status              # registry, deployed SHA vs HEAD, stack, health
+hostd tick --dry-run      # what would deploy, changes nothing
+hostd sync                # regenerate jobs.yml and compose.yml from manifests
+hostd seed [name]         # adopt current HEAD as deployed, no build
+hostd install             # install the binary, the registry and both agents
+```
+
+Deploys are pull-based, so there is no webhook, no public endpoint and no
+shared secret. An app is skipped, with one log line, when its tree is dirty,
+its checkout is off the tracked branch, the branch diverged, the watchdog holds
+its lock, or that commit already failed to build three times. Fast-forward
+only, never `reset --hard`, so an auto-deploy cannot eat uncommitted work.
+
+Requires **Full Disk Access for `/opt/homebrew/bin/git`**, and `yq` on the host
+(`brew install yq`). Under launchd macOS denies `~/Documents` per binary: git
+and podman hold grants, bash does not. That is why manifests are read with
+`git show` and the registry is installed to `~/.local/etc`. See `SPEC.md`.
+
+## Tests
+
+```sh
+./framework/test.sh
+```
+
+39 assertions against a real git origin and real containers, isolated from the
+live stacks. Needs `alpine:latest` locally.
+
+## backupd
+
+The backup container. Loops every `BACKUP_INTERVAL_SECONDS`, reads `jobs.yml`
+and pushes to R2.
 
 ```sh
 cp .env.example .env   # fill in R2 creds
@@ -14,25 +85,15 @@ podman compose up -d --build
 podman logs -f backupd_backupd_1
 ```
 
-## Adding an app
+`jobs.yml` and the `# >>> hostd:` blocks in `compose.yml` are **generated** by
+`hostd sync` from every app's `deploy.yml`. Do not edit them by hand.
 
-1. Mount its volume in `compose.yml` at `/sources/<app>:ro`. The producing stack must declare its volume with a stable name (e.g. `name: myapp-data` in the app's compose) so Podman skips the project prefix.
-2. Append to `jobs.yml`:
+Job types:
 
-   ```yaml
-   - name: myapp-db
-     type: sqlite
-     source: /sources/myapp/app.db
-     destination: myapp/db/app.db.gz
-   ```
-3. `podman compose up -d`.
-
-## Job types
-
-- `sqlite`: hot backup via `sqlite3 .backup`, gzip, upload. Replaces previous. No versioning.
-- `sync`: `rclone sync` a directory. Mirrors the source (deletes at dest if gone from source).
-
-## Config
+- `sqlite`: hot backup via `sqlite3 .backup`, gzip, upload. Replaces the
+  previous object. No versioning.
+- `sync`: `rclone sync` a directory. Mirrors the source, so it deletes at the
+  destination what is gone from the source.
 
 `.env`:
 
@@ -43,43 +104,3 @@ podman logs -f backupd_backupd_1
 | `R2_SECRET_ACCESS_KEY` | R2 API token secret |
 | `R2_BUCKET` | Target bucket |
 | `BACKUP_INTERVAL_SECONDS` | Cycle interval (default 86400) |
-
-`jobs.yml`: list of `{ name, type, source, destination }`.
-
-## Deploys
-
-`scripts/deploy.sh` polls each repo in `scripts/apps.conf` every 5 minutes.
-When the tracked branch moves it fast-forwards the working copy and runs
-`podman compose up -d --build`. Pull-based, so there is no webhook, no public
-endpoint and no shared secret.
-
-```sh
-mkdir -p ~/.local/etc
-cp scripts/apps.conf ~/.local/etc/deployd.conf
-cp scripts/deploy.sh ~/.local/bin/deployd && chmod +x ~/.local/bin/deployd
-~/.local/bin/deployd --seed          # adopt what's running now, no rebuild
-cp scripts/deployd.plist ~/Library/LaunchAgents/in.sixeleven.deployd.plist
-launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/in.sixeleven.deployd.plist
-```
-
-Needs Full Disk Access for `/opt/homebrew/bin/git`. Under launchd, macOS
-denies `~/Documents` per binary: `git` and `podman` hold grants, `bash` does
-not, which is why the registry is installed to `~/.local/etc` rather than read
-from this repo.
-
-Add a stack with one line in `scripts/apps.conf`, then re-copy it to
-`~/.local/etc/deployd.conf`:
-
-```
-<name>  <repo path>  <branch>
-```
-
-`<name>` must match the app's watchdog label suffix (`in.sixeleven.<name>`),
-since deployd takes that lock before rebuilding.
-
-It skips an app, and says so in `~/Library/Logs/deployd.log`, when the working
-tree is dirty, the checkout is off the tracked branch, the branch diverged, a
-watchdog holds the lock, or that commit already failed to build. Fast-forward
-only, never `reset --hard`, so an auto-deploy cannot eat uncommitted work.
-
-No rollback: revert and push, and deployd picks it up.

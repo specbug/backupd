@@ -1,0 +1,590 @@
+#!/bin/bash
+# hostd. Deploys and supervises every compose stack on this Mac.
+#
+# One binary, one registry, two launchd agents, regardless of how many apps
+# are hosted. Apps declare themselves in a `deploy.yml` at their repo root
+# (see SPEC.md); nothing app-specific lives in here.
+#
+# Replaces the three hand-maintained scripts this repo and odyssey used to
+# carry (two `start.sh` watchdogs plus `deploy.sh`), which had already drifted
+# apart: fixes made in one were never propagated to the others.
+#
+# Subcommands:
+#   watch          one supervision pass over every app        (launchd, 120s)
+#   tick           one deploy pass over every app             (launchd, 300s)
+#   status         what is registered, running, deployed
+#   add <repo>     register an app and regenerate             (interactive)
+#   rm <name>      unregister an app and regenerate           (interactive)
+#   sync           regenerate jobs.yml + compose.yml mounts   (interactive)
+#   install        install binary, registry and launchd agents
+#   seed [name]    adopt current HEAD as deployed, no build
+#
+# Flags: --dry-run (tick), --verbose
+#
+# TCC: under launchd, macOS denies bash every read inside ~/Documents, while
+# git and podman hold Full Disk Access. Every manifest read therefore goes
+# through `git show`, never `cat`. See SPEC.md, "Reading app manifests".
+set -euo pipefail
+
+PODMAN="${PODMAN:-/opt/homebrew/bin/podman}"
+YQ="${YQ:-/opt/homebrew/bin/yq}"
+CONF="${HOSTD_CONF:-$HOME/.local/etc/hostd/apps.conf}"
+STATE_DIR="${HOSTD_STATE:-$HOME/.local/state/hostd}"
+MANIFEST=deploy.yml
+
+WATCH_INTERVAL=120
+DEPLOY_INTERVAL=300
+COMPOSE_TIMEOUT="${COMPOSE_TIMEOUT:-120}"     # watchdog `compose up`
+BUILD_TIMEOUT_DEFAULT="${BUILD_TIMEOUT:-900}" # deploy `compose up --build`
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+HEALTH_RETRIES=3
+HEALTH_GAP=5
+
+DRY_RUN=0
+VERBOSE=0
+TAG=hostd
+
+log()  { echo "[$TAG] $(date '+%H:%M:%S') $*"; }
+vlog() { (( VERBOSE )) && log "$*" || true; }
+die()  { echo "[$TAG] error: $*" >&2; exit 1; }
+
+# --- locking ---------------------------------------------------------------
+# mkdir is the atomic gate; the pid file inside only records who won. The
+# two-second re-check matters: without it, an instance that wins mkdir but has
+# not yet written its pid looks identical to a stale lock, and a rival will
+# reclaim it. Both would then run `podman machine start`, whose gvproxy
+# processes SIGTERM each other. This is the hardened form from odyssey's
+# start.sh; the copies in backupd and deployd never received it.
+claim_lock() { echo "$$" > "$1/pid"; }
+
+live_owner() {
+    local owner
+    owner=$(cat "$1/pid" 2>/dev/null || true)
+    [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null
+}
+
+acquire() {
+    local lock="$1"
+    if mkdir "$lock" 2>/dev/null; then claim_lock "$lock"; return 0; fi
+    live_owner "$lock" && return 1
+    sleep 2
+    live_owner "$lock" && return 1
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || return 1
+    claim_lock "$lock"
+}
+
+release() { rm -rf "$1"; }
+
+# --- timeout ---------------------------------------------------------------
+# macOS ships no GNU `timeout`. A wedged compose call must not hold a lock
+# forever.
+with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local cmd_pid=$!
+    (
+        sleep "$secs"
+        kill -TERM "$cmd_pid" 2>/dev/null && sleep 3
+        kill -KILL "$cmd_pid" 2>/dev/null
+    ) &
+    local killer_pid=$!
+    local rc=0
+    wait "$cmd_pid" 2>/dev/null || rc=$?
+    kill "$killer_pid" 2>/dev/null || true
+    wait "$killer_pid" 2>/dev/null || true
+    return "$rc"
+}
+
+# --- podman ----------------------------------------------------------------
+socket_ready() { "$PODMAN" ps >/dev/null 2>&1; }
+
+ensure_machine() {
+    socket_ready && return 0
+    log "podman socket not ready, starting machine..."
+    "$PODMAN" machine start 2>&1 | grep -v "already running" || true
+    local i
+    for i in $(seq 1 60); do
+        socket_ready && { log "socket ready."; return 0; }
+        sleep 2
+    done
+    log "machine socket never came up, will retry next cycle"
+    return 1
+}
+
+# Names of running containers, or non-zero if podman could not be asked.
+#
+# The distinction is the whole point. The old watchdogs wrote
+# `running=$(podman ps ...  || true)`, which turns a failed call into an empty
+# string, which reads as "every container is down" and triggers a pointless
+# `compose up`. Measured at 2928 of 7890 log lines on this box. A genuinely
+# empty list is legitimate (nothing is up yet), so only a non-zero exit is
+# treated as failure, and it is retried once before being believed.
+running_containers() {
+    local out rc=0
+    out=$("$PODMAN" ps --format '{{.Names}}' 2>/dev/null) || rc=$?
+    if (( rc != 0 )); then
+        sleep 2
+        rc=0
+        out=$("$PODMAN" ps --format '{{.Names}}' 2>/dev/null) || rc=$?
+        (( rc != 0 )) && return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+# Capture first, match second. Piping podman into `grep -q` under `pipefail`
+# reports 141: grep exits on the match and podman dies of SIGPIPE writing the
+# rest. That read as "down" on ~27% of ticks in odyssey before it was fixed,
+# and backupd's copy was never fixed at all.
+is_running() { grep -qx "$2" <<<"$1"; }
+
+# --- manifests -------------------------------------------------------------
+# Read from git, not from disk: bash cannot open anything under ~/Documents
+# when launchd starts it, but git holds Full Disk Access. Reading the committed
+# blob rather than the working copy is also the correct semantics, since a
+# deploy only ever ships committed state.
+manifest_raw() { git -C "$1" show "HEAD:$MANIFEST" 2>/dev/null; }
+
+has_manifest() { manifest_raw "$1" >/dev/null 2>&1 && [[ -n "$(manifest_raw "$1")" ]]; }
+
+# Populates M_* for one app. No eval: values arrive as tab-separated pairs and
+# are matched with a case statement, so a manifest cannot inject shell.
+load_manifest() {
+    local repo="$1" parsed k v
+    M_NAME=""; M_BRANCH="main"; M_CONTAINER=""; M_URL=""; M_RESTART=""
+    M_TIMEOUT="$BUILD_TIMEOUT_DEFAULT"; M_VOLUME=""; M_REPO="$repo"
+
+    parsed=$(manifest_raw "$repo" | "$YQ" -r '
+        "name\t"      + (.name // "")             + "\n" +
+        "branch\t"    + (.branch // "main")       + "\n" +
+        "container\t" + (.health.container // "") + "\n" +
+        "url\t"       + (.health.url // "")       + "\n" +
+        "restart\t"   + (.health.restart // "")   + "\n" +
+        "volume\t"    + (.backup.volume // "")    + "\n" +
+        "timeout\t"   + (.build.timeout // 0 | tostring)
+    ' 2>/dev/null) || return 1
+    [[ -z "$parsed" ]] && return 1
+
+    while IFS="$(printf '\t')" read -r k v; do
+        case "$k" in
+            name)      M_NAME="$v" ;;
+            branch)    [[ -n "$v" ]] && M_BRANCH="$v" ;;
+            container) M_CONTAINER="$v" ;;
+            url)       M_URL="$v" ;;
+            restart)   M_RESTART="$v" ;;
+            volume)    M_VOLUME="$v" ;;
+            timeout)   [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )) && M_TIMEOUT="$v" ;;
+        esac
+    done <<EOF
+$parsed
+EOF
+
+    [[ -n "$M_NAME" ]] || return 1
+    [[ "$M_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { log "$repo: invalid name '$M_NAME'"; return 1; }
+    [[ -z "$M_RESTART" ]] && M_RESTART="$M_CONTAINER"
+    return 0
+}
+
+# One row per job. `name` is optional, and an omitted one must not shift the
+# columns: tab counts as IFS *whitespace*, so bash `read` silently swallows a
+# leading empty field and collapses runs of tabs. A sentinel keeps every row
+# four fields wide regardless.
+JOB_NONE="(unnamed)"
+manifest_jobs() {
+    manifest_raw "$1" | "$YQ" -r \
+        '.backup.jobs[]? | ((.name // "'"$JOB_NONE"'") + "\t" + (.type // "sync")
+          + "\t" + (.source // "") + "\t" + (.destination // ""))' \
+        2>/dev/null || true
+}
+
+# --- registry --------------------------------------------------------------
+# One repo path per line. Name, branch and everything else come from that
+# repo's own manifest, so registering an app is a path and nothing more.
+read_registry() {
+    [[ -f "$CONF" ]] || die "no registry at $CONF (run: hostd install)"
+    grep -v '^[[:space:]]*#' "$CONF" | grep -v '^[[:space:]]*$' || true
+}
+
+app_lock()  { echo "/tmp/hostd.$1.lock"; }
+state_file() { echo "$STATE_DIR/$1"; }
+
+compose_up()       { cd "$1" && "$PODMAN" compose up -d; }
+compose_up_build() { cd "$1" && "$PODMAN" compose up -d --build; }
+
+# --- watch -----------------------------------------------------------------
+# One pass over every app. The machine is started at most once per pass, by
+# this function and nothing else, which is what makes the concurrent
+# `machine start` race structurally impossible rather than merely avoided.
+cmd_watch() {
+    TAG=hostd-watch
+    local lock=/tmp/hostd.watch.lock
+    acquire "$lock" || exit 0
+    trap "release '$lock'" EXIT
+
+    ensure_machine || exit 1
+
+    local running
+    running=$(running_containers) || { log "podman ps failed twice, skipping pass"; exit 1; }
+
+    local repo
+    for repo in $(read_registry); do
+        load_manifest "$repo" || { log "$repo: unreadable manifest, skipping"; continue; }
+        [[ -n "$M_CONTAINER" ]] || { vlog "$M_NAME: no health.container, skipping"; continue; }
+
+        local alock; alock=$(app_lock "$M_NAME")
+        acquire "$alock" || { vlog "$M_NAME: locked by a deploy, skipping"; continue; }
+
+        if ! is_running "$running" "$M_CONTAINER"; then
+            log "$M_NAME: $M_CONTAINER not up, bringing up stack..."
+            if with_timeout "$COMPOSE_TIMEOUT" compose_up "$repo" >"/tmp/hostd-$M_NAME.compose.log" 2>&1; then
+                log "$M_NAME: stack up."
+            else
+                log "$M_NAME: compose up failed or timed out, see /tmp/hostd-$M_NAME.compose.log"
+            fi
+            release "$alock"
+            continue   # let it warm; probe on the next pass
+        fi
+
+        if [[ -n "$M_URL" ]]; then
+            probe_health "$M_NAME" "$M_URL" "$M_RESTART"
+        fi
+        release "$alock"
+    done
+}
+
+probe_health() {
+    local name="$1" url="$2" target="$3" i
+    for i in $(seq 1 "$HEALTH_RETRIES"); do
+        if curl -fsS -m 3 "$url" >/dev/null 2>&1; then
+            vlog "$name: healthy"
+            return 0
+        fi
+        (( i < HEALTH_RETRIES )) && sleep "$HEALTH_GAP"
+    done
+    [[ -n "$target" ]] || { log "$name: health failed, no restart target declared"; return 0; }
+    log "$name: health failed ${HEALTH_RETRIES}x, restarting $target"
+    "$PODMAN" restart "$target" >/dev/null 2>&1 || log "$name: restart failed"
+}
+
+# --- tick (deploy) ---------------------------------------------------------
+cmd_tick() {
+    TAG=hostd-deploy
+    local lock=/tmp/hostd.deploy.lock
+    acquire "$lock" || exit 0
+    trap "release '$lock'" EXIT
+
+    # Never start the machine here. cmd_watch owns that, and two concurrent
+    # starts collapse the VM. If the socket is down, wait for the watchdog.
+    socket_ready || exit 0
+
+    local repo
+    for repo in $(read_registry); do
+        load_manifest "$repo" || { log "$repo: unreadable manifest, skipping"; continue; }
+        deploy_app "$repo" </dev/null
+    done
+}
+
+# Called with stdin closed: git shells out to ssh, which drains stdin and
+# would otherwise swallow the rest of the registry.
+deploy_app() {
+    local repo="$1"
+    local name="$M_NAME" branch="$M_BRANCH" timeout="$M_TIMEOUT"
+    local state failed remote deployed current rc=0
+    state=$(state_file "$name"); failed="$state.failed"
+
+    # Ask git, not bash. `[[ -d $repo/.git ]]` is denied by TCC under launchd
+    # and would be indistinguishable from "not a repo".
+    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 \
+        || { log "$name: $repo is not a readable git repo, skipping"; return 0; }
+
+    remote=$(git -C "$repo" ls-remote origin "refs/heads/$branch" 2>/dev/null | cut -f1)
+    [[ -n "$remote" ]] || { log "$name: cannot reach origin/$branch, retrying next tick"; return 0; }
+
+    deployed=$(cat "$state" 2>/dev/null || true)
+    [[ "$remote" == "$deployed" ]] && return 0
+
+    # A commit that will not build is abandoned after MAX_ATTEMPTS so it cannot
+    # rebuild every tick forever, but not on the first failure: a build starts
+    # milliseconds after git rewrote the tree, and the podman VM's view of a
+    # just-replaced file can be briefly stale.
+    local failed_sha="" attempts=0
+    if [[ -f "$failed" ]]; then read -r failed_sha attempts < "$failed" || true; fi
+    [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+    if [[ "$remote" != "$failed_sha" ]]; then
+        attempts=0
+    elif (( attempts >= MAX_ATTEMPTS )); then
+        return 0
+    fi
+
+    local shown="${deployed:0:8}"
+    log "$name: origin/$branch at ${remote:0:8}, deployed ${shown:-none}"
+
+    # Guards. Anything unexpected about the working copy is a skip, never a
+    # force: an auto-deploy must not be able to lose your work.
+    current=$(git -C "$repo" rev-parse --abbrev-ref HEAD)
+    [[ "$current" == "$branch" ]] \
+        || { log "$name: checked out on '$current', not '$branch', skipping"; return 0; }
+    [[ -z "$(git -C "$repo" status --porcelain)" ]] \
+        || { log "$name: working tree dirty, skipping"; return 0; }
+
+    if (( DRY_RUN )); then
+        log "$name: DRY RUN, would fast-forward to ${remote:0:8} and rebuild"
+        return 0
+    fi
+
+    local alock; alock=$(app_lock "$name")
+    acquire "$alock" || { log "$name: watchdog holds the lock, retrying next tick"; return 0; }
+
+    local build_log="/tmp/hostd-$name.build.log"
+    if ! git -C "$repo" fetch --quiet origin "$branch"; then
+        release "$alock"; log "$name: fetch failed, retrying next tick"; return 0
+    fi
+    # Divergence is a state of the repo, not a build failure. Reporting it as
+    # itself beats burning retries against an empty compose log.
+    if ! git -C "$repo" merge-base --is-ancestor HEAD "$remote"; then
+        release "$alock"; log "$name: local $branch has diverged from origin, skipping"; return 0
+    fi
+
+    git -C "$repo" merge --ff-only --quiet "$remote" \
+        && with_timeout "$timeout" compose_up_build "$repo" >"$build_log" 2>&1 \
+        || rc=$?
+    release "$alock"
+
+    mkdir -p "$STATE_DIR"
+    if (( rc != 0 )); then
+        attempts=$(( attempts + 1 ))
+        echo "$remote $attempts" > "$failed"
+        if (( attempts >= MAX_ATTEMPTS )); then
+            log "$name: deploy failed (rc=$rc) ${attempts}/${MAX_ATTEMPTS}, giving up on ${remote:0:8} until a newer commit lands. See $build_log"
+        else
+            log "$name: deploy failed (rc=$rc) ${attempts}/${MAX_ATTEMPTS}, retrying next tick. See $build_log"
+        fi
+        return 0
+    fi
+
+    echo "$remote" > "$state"
+    rm -f "$failed"
+    "$PODMAN" image prune -f >/dev/null 2>&1 || true
+    log "$name: deployed ${remote:0:8}"
+
+    # If what we just deployed was hostd itself, refresh the installed copy.
+    # git does the reading (bash cannot, under launchd) and mv is atomic, so
+    # the currently-running script keeps its own inode and finishes normally.
+    if git -C "$repo" show HEAD:framework/hostd >/dev/null 2>&1; then
+        self_install "$repo" && log "$name: refreshed installed hostd"
+    fi
+}
+
+self_install() {
+    local repo="$1" tmp="$HOME/.local/bin/.hostd.$$"
+    mkdir -p "$HOME/.local/bin" "$(dirname "$CONF")"
+    git -C "$repo" show HEAD:framework/hostd > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod +x "$tmp"
+    mv -f "$tmp" "$HOME/.local/bin/hostd"
+    git -C "$repo" show HEAD:framework/apps.conf > "$CONF" 2>/dev/null || true
+}
+
+# --- interactive commands --------------------------------------------------
+# `add`, `rm` and `sync` write into the framework repo under ~/Documents, so
+# they only ever run from a login shell, never from launchd. They locate the
+# repo from the working directory rather than from a recorded path, so there
+# is nothing to keep in sync.
+framework_repo() {
+    local top
+    top=$(git rev-parse --show-toplevel 2>/dev/null) \
+        || die "not inside a git repo (run this from the hostd repo)"
+    [[ -f "$top/framework/hostd" ]] \
+        || die "$top is not the hostd repo (no framework/hostd)"
+    echo "$top"
+}
+
+cmd_seed() {
+    local want="${1:-}" repo found=0
+    mkdir -p "$STATE_DIR"
+    for repo in $(read_registry); do
+        load_manifest "$repo" || continue
+        [[ -n "$want" && "$M_NAME" != "$want" ]] && continue
+        found=1
+        git -C "$repo" rev-parse HEAD > "$(state_file "$M_NAME")"
+        rm -f "$(state_file "$M_NAME").failed"
+        log "$M_NAME: seeded at $(cut -c1-8 "$(state_file "$M_NAME")")"
+    done
+    (( found )) || die "no such app: $want"
+}
+
+cmd_status() {
+    local repo running have_podman=1
+    running=$(running_containers) || have_podman=0
+    printf '%-12s %-8s %-10s %-10s %-9s %s\n' APP BRANCH DEPLOYED HEAD STACK HEALTH
+    for repo in $(read_registry); do
+        if ! load_manifest "$repo"; then
+            printf '%-12s %-8s %-10s %-10s %-9s %s\n' "$(basename "$repo")" - - - - "no manifest"
+            continue
+        fi
+        local dep head stack health
+        dep=$(cat "$(state_file "$M_NAME")" 2>/dev/null || echo "-")
+        head=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "-")
+        if (( have_podman )) && [[ -n "$M_CONTAINER" ]]; then
+            is_running "$running" "$M_CONTAINER" && stack=up || stack=DOWN
+        else
+            stack="?"
+        fi
+        if [[ -z "$M_URL" ]]; then
+            health="-"
+        elif curl -fsS -m 3 "$M_URL" >/dev/null 2>&1; then
+            health=ok
+        else
+            health=FAIL
+        fi
+        [[ -f "$(state_file "$M_NAME").failed" ]] && health="$health (build failing)"
+        printf '%-12s %-8s %-10s %-10s %-9s %s\n' \
+            "$M_NAME" "$M_BRANCH" "${dep:0:8}" "${head:0:8}" "$stack" "$health"
+    done
+}
+
+cmd_add() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || die "usage: hostd add <repo-path>"
+    path=$(cd "$path" 2>/dev/null && pwd) || die "no such directory: $1"
+    local top; top=$(framework_repo)
+    local reg="$top/framework/apps.conf"
+
+    has_manifest "$path" || die "$path has no committed $MANIFEST (add and commit one first, see SPEC.md)"
+    load_manifest "$path" || die "$path: $MANIFEST is invalid"
+    grep -qxF "$path" "$reg" 2>/dev/null && die "$M_NAME is already registered"
+
+    echo "$path" >> "$reg"
+    log "registered $M_NAME ($path, branch $M_BRANCH)"
+    cmd_sync
+    log "next: commit the generated changes, then run 'hostd install'"
+}
+
+cmd_rm() {
+    local want="${1:-}"
+    [[ -n "$want" ]] || die "usage: hostd rm <name>"
+    local top; top=$(framework_repo)
+    local reg="$top/framework/apps.conf" repo keep tmp
+    tmp="$reg.tmp.$$"; : > "$tmp"; keep=0
+    while read -r repo; do
+        if [[ -z "$repo" || "$repo" == \#* ]]; then echo "$repo" >> "$tmp"; continue; fi
+        if load_manifest "$repo" && [[ "$M_NAME" == "$want" ]]; then keep=1; continue; fi
+        echo "$repo" >> "$tmp"
+    done < "$reg"
+    (( keep )) || { rm -f "$tmp"; die "no such app: $want"; }
+    mv "$tmp" "$reg"
+    rm -f "$(state_file "$want")" "$(state_file "$want").failed"
+    log "unregistered $want"
+    cmd_sync
+}
+
+# Rewrites the two generated artifacts from every registered manifest:
+# jobs.yml in full, and the marked blocks inside compose.yml. Generation is
+# explicit and committed rather than resolved at runtime, so what the backup
+# container will do is visible in a diff before it happens.
+cmd_sync() {
+    local top; top=$(framework_repo)
+    local jobs_out="$top/jobs.yml" mounts body_m body_v repo
+    body_m=$(mktemp); body_v=$(mktemp)
+
+    {
+        echo "# GENERATED by 'hostd sync'. Do not edit."
+        echo "#"
+        echo "# Every job below is declared in an app's own deploy.yml under 'backup'."
+        echo "# To change one, edit that file, commit it, and re-run 'hostd sync'."
+        echo "# Source paths are volume-relative there and rooted at /sources/<app> here."
+        echo
+        echo "jobs:"
+    } > "$jobs_out"
+
+    for repo in $(read_registry); do
+        load_manifest "$repo" || continue
+        [[ -n "$M_VOLUME" ]] || continue
+
+        printf '      - %s:/sources/%s:ro\n' "$M_VOLUME" "$M_NAME" >> "$body_m"
+        printf '  %s:\n    external: true\n    name: %s\n' "$M_VOLUME" "$M_VOLUME" >> "$body_v"
+
+        local i=0 jname jtype jsrc jdst
+        while IFS="$(printf '\t')" read -r jname jtype jsrc jdst; do
+            [[ -n "${jtype:-}" ]] || continue
+            i=$(( i + 1 ))
+            [[ "$jname" == "$JOB_NONE" ]] && jname="$M_NAME-$i"
+            if [[ -z "$jsrc" || -z "$jdst" ]]; then
+                log "$M_NAME: job $i is missing source or destination, skipped"
+                continue
+            fi
+            printf '  - name: %s\n    type: %s\n    source: /sources/%s/%s\n    destination: %s\n' \
+                "$jname" "$jtype" "$M_NAME" "${jsrc#/}" "$jdst" >> "$jobs_out"
+        done <<EOF
+$(manifest_jobs "$repo")
+EOF
+    done
+
+    replace_block "$top/compose.yml" mounts  "$body_m"
+    replace_block "$top/compose.yml" volumes "$body_v"
+    rm -f "$body_m" "$body_v"
+    log "regenerated jobs.yml and compose.yml from $(read_registry | wc -l | tr -d ' ') manifests"
+}
+
+# Substitutes the lines between the hostd markers, leaving everything around
+# them, including comments, untouched.
+replace_block() {
+    local file="$1" marker="$2" body="$3" tmp="$1.tmp.$$"
+    grep -q "hostd:$marker" "$file" || die "$file has no '# >>> hostd:$marker' block"
+    awk -v m="hostd:$marker" -v b="$body" '
+        index($0, ">>> " m) { print; while ((getline l < b) > 0) print l; skip=1; next }
+        index($0, "<<< " m) { skip=0 }
+        !skip { print }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+cmd_install() {
+    local top; top=$(framework_repo)
+    local bin="$HOME/.local/bin" agents="$HOME/Library/LaunchAgents"
+    mkdir -p "$bin" "$(dirname "$CONF")" "$STATE_DIR" "$agents"
+
+    install -m 0755 "$top/framework/hostd" "$bin/hostd"
+    install -m 0644 "$top/framework/apps.conf" "$CONF"
+    log "installed $bin/hostd and $CONF"
+
+    render_plist watch  "$WATCH_INTERVAL"  "$top" "$agents"
+    render_plist deploy "$DEPLOY_INTERVAL" "$top" "$agents"
+    log "run 'hostd status' to confirm, and 'hostd seed' if adopting a running stack"
+}
+
+render_plist() {
+    local sub="$1" interval="$2" top="$3" agents="$4"
+    local label="in.sixeleven.hostd-$sub" out="$agents/in.sixeleven.hostd-$sub.plist"
+    sed -e "s|@@LABEL@@|$label|g" \
+        -e "s|@@SUBCOMMAND@@|$sub|g" \
+        -e "s|@@INTERVAL@@|$interval|g" \
+        -e "s|@@HOME@@|$HOME|g" \
+        "$top/framework/templates/agent.plist" > "$out"
+    launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$UID" "$out"
+    log "installed and bootstrapped $label (every ${interval}s)"
+}
+
+# --- dispatch --------------------------------------------------------------
+SUB="${1:-}"; shift || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --verbose|-v) VERBOSE=1; shift ;;
+        *) break ;;
+    esac
+done
+
+case "$SUB" in
+    watch)   cmd_watch ;;
+    tick)    cmd_tick ;;
+    status)  cmd_status ;;
+    add)     cmd_add "${1:-}" ;;
+    rm)      cmd_rm "${1:-}" ;;
+    sync)    cmd_sync ;;
+    install) cmd_install ;;
+    seed)    cmd_seed "${1:-}" ;;
+    ""|-h|--help)
+        sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *) die "unknown subcommand '$SUB' (try: hostd --help)" ;;
+esac
