@@ -65,6 +65,15 @@ Requires **Full Disk Access for `/opt/homebrew/bin/git`**, and `yq` on the host
 and podman hold grants, bash does not. That is why manifests are read with
 `git show` and the registry is installed to `~/.local/etc`. See `SPEC.md`.
 
+## Tests
+
+```sh
+./framework/test.sh
+```
+
+39 assertions against a real git origin and real containers, isolated from the
+live stacks. Needs `alpine:latest` locally.
+
 ## backupd
 
 The backup container. Loops every `BACKUP_INTERVAL_SECONDS`, reads `jobs.yml`

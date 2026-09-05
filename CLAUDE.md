@@ -97,7 +97,24 @@ podman exec backupd_backupd_1 sh -c '
 '
 ```
 
-No tests, no lint.
+### Tests
+
+`framework/test.sh` is an integration harness: 39 assertions driving the real
+deploy state machine against a real git origin and real containers. It is
+isolated from the live stacks (own compose project, registry, state dir and
+locks, plus a podman wrapper that swallows `image prune`) and needs only a
+local `alpine:latest`.
+
+```sh
+./framework/test.sh     # ~40s
+```
+
+Run it after touching `framework/hostd`. It covers the guards (dirty tree,
+wrong branch, divergence), the retry budget and give-up, the newer-commit
+clear, dry-run inertness, the watchdog bring-up and health restart, the
+`podman ps` failure path, locking, and plist rendering.
+
+No lint.
 
 ### Non-obvious bits
 
