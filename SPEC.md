@@ -142,5 +142,8 @@ previous design repeated in three places.
   merged back. Intended, easy to forget, check the log if a deploy "did not
   happen".
 - An uncommitted `deploy.yml` change has no effect. hostd reads HEAD.
+- A job's `destination` addresses every remote: R2, and Google Drive rooted at
+  the `sixeleven.in` folder. Drive is best-effort — a failed Drive leg is
+  logged, never fatal, and never delays or fails the R2 leg.
 - `rclone sync` deletes remote objects that vanish from the source. Mirror
   semantics, not retention.

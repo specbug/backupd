@@ -7,7 +7,8 @@ This repo is two things, and the split is the first thing to understand:
 - **`framework/`** is **hostd**, which deploys and supervises every compose
   stack on this Mac mini. It is generic. Nothing app-specific belongs in it.
 - **everything at the root** is **backupd**, one of the apps hostd hosts. It
-  is a container that runs `backup.sh` in a loop and ships app data to R2.
+  is a container that runs `backup.sh` in a loop and ships app data to R2, with
+  a second copy on Google Drive.
 
 `SPEC.md` is the contract between hostd and the apps. Read it before changing
 either half. Host reliability (FileVault, auto-login, `pmset`, weekly reboot)
@@ -77,8 +78,15 @@ input. Editing them by hand is wrong and will be overwritten. The input is the
 `BACKUP_INTERVAL_SECONDS`, parses `jobs.yml`, and dispatches per job `type`:
 
 - `sqlite`: `sqlite3 -readonly <src> ".backup /tmp/<name>.db"`, gzip,
-  `rclone copyto`. Replaces the previous object every cycle. No versioning.
+  `rclone copyto`. Replaces the previous object every cycle. The snapshot is
+  taken once and shipped to every remote, so they hold identical bytes.
 - `sync`: `rclone sync`. Additive for new files, destructive on the dest side.
+
+Each job fans out to R2 (primary, failures are fatal to the cycle) and then to
+Google Drive (secondary, failures are logged and counted). R2 has no
+versioning, which is the entire reason Drive is there; the Drive leg runs with
+`--backup-dir` so overwrites and deletions land in `_versions/<date>/` instead
+of being lost.
 
 ```sh
 podman compose up -d --build
@@ -95,6 +103,19 @@ podman exec backupd_backupd_1 sh -c '
   export RCLONE_CONFIG_R2_REGION=auto
   rclone ls r2:$R2_BUCKET --s3-no-check-bucket
 '
+
+# same for the Drive side
+podman exec backupd_backupd_1 sh -c '
+  export RCLONE_CONFIG_GDRIVE_TYPE=drive
+  export RCLONE_CONFIG_GDRIVE_SCOPE=drive
+  export RCLONE_CONFIG_GDRIVE_TOKEN="$GDRIVE_TOKEN"
+  export RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID="$GDRIVE_ROOT_FOLDER_ID"
+  rclone ls gdrive:
+  rclone lsf --dirs-only gdrive:_versions      # the dated archive buckets
+'
+
+# run one cycle now instead of waiting out BACKUP_INTERVAL_SECONDS
+podman exec -e BACKUP_ONCE=1 backupd_backupd_1 /usr/local/bin/backup.sh
 ```
 
 ### Tests
@@ -114,12 +135,26 @@ wrong branch, divergence), the retry budget and give-up, the newer-commit
 clear, dry-run inertness, the watchdog bring-up and health restart, the
 `podman ps` failure path, locking, and plist rendering.
 
+It does **not** cover `backup.sh`. That has its own harness at `./test.sh`:
+37 assertions, no credentials, no network, no container, because rclone and
+sqlite3 are stubs that record their argv. Run it after touching `backup.sh`.
+
+```sh
+./test.sh     # ~2s
+```
+
+It exists mainly to hold two invariants that are easy to break by accident: a
+Drive failure must never fail the R2 leg or the cycle, and an R2 failure must
+never be reported as success. Before status was tracked by hand, the second one
+was broken — see the Gotchas below.
+
 No lint.
 
 ### Non-obvious bits
 
-- rclone is configured only via `RCLONE_CONFIG_R2_*` env vars. No `rclone.conf`.
-  The `NOTICE: Config file … not found - using defaults` line is expected.
+- rclone is configured only via `RCLONE_CONFIG_{R2,GDRIVE}_*` env vars. No
+  `rclone.conf`. The `NOTICE: Config file … not found - using defaults` line is
+  expected.
 - `yq` is the Go one (mikefarah). Syntax is `yq '.jobs[0].name'`. The host needs
   it too now, for hostd: `brew install yq`.
 - Source volumes are mounted `:ro`, so `sqlite3 -readonly` is required: WAL-mode
@@ -127,6 +162,18 @@ No lint.
 - Every rclone call uses `--s3-no-check-bucket`. R2 tokens are scoped to one
   bucket, so the default `HeadBucket` precheck 403s.
 - R2 key layout is `<app>/<resource-type>/<object>`. One bucket, per-app prefix.
+- The same key addresses Drive, because that remote is rooted at the
+  `sixeleven.in` folder via `RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID`. That is the
+  whole reason `deploy.yml`, `hostd sync` and `jobs.yml` needed no changes when
+  Drive was added: a `destination` is remote-agnostic. Keep it that way.
+- Drive scope must be full `drive`, not `drive.file`. `drive.file` only sees
+  files the app itself created, so it cannot resolve a pre-existing folder id
+  and the root pin silently resolves to nothing.
+- Blank `GDRIVE_CLIENT_ID`/`_SECRET` deliberately uses rclone's own published
+  OAuth client, whose refresh tokens do not expire. If you ever swap in a
+  self-made client, publish it: one left in "Testing" status expires refresh
+  tokens every 7 days, and the failure is a quiet `token expired` per job while
+  R2 keeps working, so nothing looks broken until you need a restore.
 - `jobs.yml` is read once at startup, so the container must be recreated after
   it changes. A deploy does that anyway.
 
@@ -135,6 +182,17 @@ No lint.
 - `sqlite` jobs re-upload the full DB every cycle. Fine for small DBs; revisit
   if one grows to hundreds of MB.
 - `rclone sync` deletes remote objects that vanish from source. Intentional
-  mirror semantics, not retention.
+  mirror semantics, not retention. On R2 that is the end of the story; on Drive
+  the deletion lands in `_versions/<date>/` first, which is the only reason a
+  corrupted source is recoverable.
+- Drive is secondary and must stay unable to break the primary: a failed Drive
+  leg is logged and counted, never fatal, and bad Drive settings degrade to
+  R2-only instead of exiting. If you add a third remote, keep that shape.
+- **`set -e` does not apply inside `run_all_jobs`.** It is called as
+  `if run_all_jobs`, and bash disables errexit for the whole dynamic extent of
+  a function whose status is tested. Every failure there must be caught and
+  returned by hand. This was a real bug: three failed R2 uploads logged
+  `job done` and `cycle complete; sleeping 86400s`, so a total outage looked
+  like a clean backup. `./test.sh` pins it.
 - R2 free tier: 10 GB storage, 1M Class A ops/month, 10M Class B. Storage is
   the variable to watch as sync sources grow.
