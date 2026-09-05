@@ -217,21 +217,63 @@ out=$(watch --verbose); has "app lock blocks the watchdog" "$out" "locked by a d
 rm -rf /tmp/hostd.testapp.lock
 
 # --- install artefacts -----------------------------------------------------
+# Exercises the real `hostd install`, with launchctl stubbed onto PATH and a
+# fake HOME, rather than re-rendering the template by hand. The hand-rendered
+# version passed while shipping a plist that invoked `hostd deploy`, which is
+# not a subcommand, so the deploy agent errored every 300s and auto-deploy was
+# silently dead. Rendering something valid is not the same as rendering
+# something that works.
 sec "install artefacts"
-FAKEHOME="$ROOT/home"; mkdir -p "$FAKEHOME/.local/bin"
-rendered="$ROOT/agent.plist"
-sed -e "s|@@LABEL@@|in.sixeleven.hostd-watch|g" -e "s|@@SUBCOMMAND@@|watch|g" \
-    -e "s|@@INTERVAL@@|120|g" -e "s|@@HOME@@|$FAKEHOME|g" \
-    "$HERE/templates/agent.plist" > "$rendered"
-if plutil -lint "$rendered" >/dev/null 2>&1; then ok "rendered plist is valid"; else bad "rendered plist is valid"; fi
-has "plist has AbandonProcessGroup" "$(cat "$rendered")" "AbandonProcessGroup"
-hasnt "no placeholders survive rendering" "$(cat "$rendered")" "@@"
+FAKEHOME="$ROOT/home"; FAKEBIN="$ROOT/fakebin"
+mkdir -p "$FAKEHOME/.local/bin" "$FAKEBIN"
+cat > "$FAKEBIN/launchctl" <<'EOF'
+#!/bin/bash
+echo "launchctl $*" >> "$LAUNCHCTL_LOG"
+EOF
+chmod +x "$FAKEBIN/launchctl"
+
+LAUNCHCTL_LOG="$ROOT/launchctl.log"; : > "$LAUNCHCTL_LOG"
+out=$(cd "$REPO" && PATH="$FAKEBIN:$PATH" HOME="$FAKEHOME" LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
+      HOSTD_CONF="$FAKEHOME/.local/etc/hostd/apps.conf" \
+      HOSTD_STATE="$FAKEHOME/.local/state/hostd" "$HOSTD" install 2>&1)
+has "install reports both agents" "$out" "hostd-watch"
+
+AG="$FAKEHOME/Library/LaunchAgents"
+# The set of subcommands hostd actually dispatches, read from its own case
+# statement, so the test cannot drift from the implementation.
+SUBS=$(awk '/^case "\$SUB" in/,/^esac/' "$HOSTD" | grep -Eo '^ +[a-z|"-]+\)' | tr -d ' )"' | tr '|' '\n')
+
+for want in watch deploy; do
+    plist="$AG/in.sixeleven.hostd-$want.plist"
+    if [[ ! -f "$plist" ]]; then bad "hostd-$want plist was written"; continue; fi
+    ok "hostd-$want plist was written"
+    if plutil -lint "$plist" >/dev/null 2>&1; then ok "hostd-$want plist is valid"; else bad "hostd-$want plist is valid"; fi
+    hasnt "hostd-$want plist has no leftover placeholders" "$(cat "$plist")" "@@"
+    has "hostd-$want plist has AbandonProcessGroup" "$(cat "$plist")" "AbandonProcessGroup"
+
+    # Second ProgramArguments entry is the subcommand hostd will be invoked with.
+    sub=$(plutil -extract ProgramArguments.1 raw -o - "$plist" 2>/dev/null || echo "")
+    if grep -qx "$sub" <<<"$SUBS"; then
+        ok "hostd-$want invokes a real subcommand ('$sub')"
+    else
+        bad "hostd-$want invokes a real subcommand" "plist says '$sub', which hostd does not dispatch"
+    fi
+    bin=$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null || echo "")
+    check "hostd-$want points at the installed binary" "$bin" "$FAKEHOME/.local/bin/hostd"
+done
+# The label and the subcommand are deliberately different for deploy. Pin it.
+check "hostd-deploy maps to the tick subcommand" \
+      "$(plutil -extract ProgramArguments.1 raw -o - "$AG/in.sixeleven.hostd-deploy.plist" 2>/dev/null)" "tick"
+check "hostd-watch maps to the watch subcommand" \
+      "$(plutil -extract ProgramArguments.1 raw -o - "$AG/in.sixeleven.hostd-watch.plist" 2>/dev/null)" "watch"
+has "install bootstrapped the agents" "$(cat "$LAUNCHCTL_LOG")" "bootstrap"
+
+if [[ -x "$FAKEHOME/.local/bin/hostd" ]]; then ok "installed binary is executable"; else bad "installed binary is executable"; fi
+if [[ -f "$FAKEHOME/.local/etc/hostd/apps.conf" ]]; then ok "registry was installed"; else bad "registry was installed"; fi
 
 out=$(HOME="$FAKEHOME" HOSTD_CONF="$FAKEHOME/.local/etc/hostd/apps.conf" \
       bash -c 'source /dev/stdin <<< "$(sed -n "/^self_install()/,/^}/p" '"$HOSTD"')"; self_install '"$REPO"' && echo INSTALLED' 2>&1)
 has "self_install writes the binary" "$out" "INSTALLED"
-if [[ -x "$FAKEHOME/.local/bin/hostd" ]]; then ok "installed binary is executable"; else bad "installed binary is executable"; fi
-if diff -q "$FAKEHOME/.local/bin/hostd" "$HOSTD" >/dev/null 2>&1; then ok "installed binary matches HEAD"; else ok "installed binary matches HEAD (differs from worktree, as designed: reads HEAD)"; fi
 
 # --- teardown --------------------------------------------------------------
 cd "$APP" && $REALPODMAN compose down -t 2 >/dev/null 2>&1

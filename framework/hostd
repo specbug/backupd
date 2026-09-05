@@ -546,14 +546,18 @@ cmd_install() {
     install -m 0644 "$top/framework/apps.conf" "$CONF"
     log "installed $bin/hostd and $CONF"
 
-    render_plist watch  "$WATCH_INTERVAL"  "$top" "$agents"
-    render_plist deploy "$DEPLOY_INTERVAL" "$top" "$agents"
+    # <label suffix> <hostd subcommand>. These differ: the deploy agent is
+    # named hostd-deploy but the subcommand is `tick`. Conflating them shipped
+    # a plist invoking `hostd deploy`, which is not a subcommand, so the agent
+    # errored every 300s and auto-deploy was silently dead.
+    render_plist watch  watch "$WATCH_INTERVAL"  "$top" "$agents"
+    render_plist deploy tick  "$DEPLOY_INTERVAL" "$top" "$agents"
     log "run 'hostd status' to confirm, and 'hostd seed' if adopting a running stack"
 }
 
 render_plist() {
-    local sub="$1" interval="$2" top="$3" agents="$4"
-    local label="in.sixeleven.hostd-$sub" out="$agents/in.sixeleven.hostd-$sub.plist"
+    local suffix="$1" sub="$2" interval="$3" top="$4" agents="$5"
+    local label="in.sixeleven.hostd-$suffix" out="$agents/in.sixeleven.hostd-$suffix.plist"
     sed -e "s|@@LABEL@@|$label|g" \
         -e "s|@@SUBCOMMAND@@|$sub|g" \
         -e "s|@@INTERVAL@@|$interval|g" \
@@ -561,7 +565,7 @@ render_plist() {
         "$top/framework/templates/agent.plist" > "$out"
     launchctl bootout "gui/$UID/$label" 2>/dev/null || true
     launchctl bootstrap "gui/$UID" "$out"
-    log "installed and bootstrapped $label (every ${interval}s)"
+    log "installed and bootstrapped $label -> hostd $sub (every ${interval}s)"
 }
 
 # --- dispatch --------------------------------------------------------------

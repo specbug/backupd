@@ -211,11 +211,21 @@ else
     info "waiting 20s for both passes to complete"
     sleep 20
 
+    # Capture, then match. `launchctl list | grep -q` under pipefail reports
+    # 141: grep exits on the match and launchctl dies of SIGPIPE writing the
+    # remaining 500-odd jobs. This exact bug read as "not loaded" on a real
+    # run. It is the same mistake the old watchdogs made against `podman ps`.
+    loaded=$(launchctl list 2>/dev/null || true)
     for a in $NEW_AGENTS; do
-        launchctl list | grep -q "in.sixeleven.$a" \
+        grep -q "in.sixeleven.$a" <<<"$loaded" \
             || die "in.sixeleven.$a is not loaded. Check ~/Library/Logs/in.sixeleven.$a-error.log"
+        # Loaded is not the same as working. A non-zero last exit status means
+        # the agent ran and failed, which is how the bad subcommand hid.
+        st=$(awk -v a="in.sixeleven.$a" '$3==a {print $2}' <<<"$loaded")
+        [[ "$st" == "0" || "$st" == "-" ]] \
+            || die "in.sixeleven.$a last exited $st. See ~/Library/Logs/in.sixeleven.$a-error.log"
     done
-    ok "both agents are loaded"
+    ok "both agents are loaded and their last run exited clean"
 
     after=$("$PODMAN" ps --format '{{.Names}}' | sort)
     before=$(cat /tmp/hostd-cutover-containers-before 2>/dev/null || echo "$CONTAINERS_BEFORE")
